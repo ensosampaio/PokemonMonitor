@@ -1,0 +1,10 @@
+{
+  "discord": {
+    "webhook_url": ""
+  },
+  "min_price_increase": 5.0,
+  "cards": [
+    "Mega Emboar ex (273/217)",
+    "Mega Lucario ex (113/217)"
+  ]
+}
