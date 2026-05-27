@@ -14,7 +14,7 @@ Usage:
     python monitor.py --reset                 # wipe stored prices
 """
 
-import asyncio
+import time
 import sqlite3
 import json
 import argparse
@@ -26,7 +26,7 @@ from pathlib import Path
 from urllib.parse import quote_plus
 
 import requests
-from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
+from DrissionPage import ChromiumPage, ChromiumOptions
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 BASE_DIR    = Path(__file__).parent
@@ -85,8 +85,8 @@ def save_price(conn: sqlite3.Connection, card: str, price: float) -> None:
         """, (card, price))
 
 # ── Discord ───────────────────────────────────────────────────────────────────
-async def send_discord_async(webhook_url: str, card: str, old_price: float,
-                             new_price: float, card_url: str) -> bool:
+def send_discord(webhook_url: str, card: str, old_price: float,
+                 new_price: float, card_url: str) -> bool:
     diff = new_price - old_price
     rose = diff > 0
     embed = {
@@ -101,11 +101,8 @@ async def send_discord_async(webhook_url: str, card: str, old_price: float,
         "footer": {"text": "LigaPokemon Price Monitor"},
     }
 
-    def _post():
-        return requests.post(webhook_url, json={"embeds": [embed]}, timeout=10)
-
     try:
-        r = await asyncio.to_thread(_post)
+        r = requests.post(webhook_url, json={"embeds": [embed]}, timeout=10)
         if r.ok:
             log.info(f"Discord alert sent for {card}.")
             return True
@@ -132,28 +129,27 @@ def extract_prices(text: str) -> list[float]:
             continue
     return valid_prices
 
-async def fetch_lowest_price(page, card_name: str) -> float | None:
+def fetch_lowest_price(page: ChromiumPage, card_name: str) -> float | None:
     log.info(f"Fetching: {build_url(card_name)}")
 
     try:
-        await page.goto(build_url(card_name), wait_until="domcontentloaded", timeout=20_000)
+        page.get(build_url(card_name))
 
-        # LigaPokemon uses the same platform as LigaMagic.
-        # The market summary box (#container-price-mkp-card) pre-computes
-        # min/avg/max prices — we just read the minimum directly.
-        summary_row = page.locator("#container-price-mkp-card")
-        await summary_row.wait_for(state="visible", timeout=10_000)
-        row_text = await summary_row.inner_text()
-        extracted = extract_prices(row_text)
+        # DrissionPage wait logic automatically handles timeouts seamlessly
+        el = page.ele("#container-price-mkp-card", timeout=15)
 
-        if extracted:
-            lowest = min(extracted)
-            log.info(f"  Lowest price found: R$ {lowest:.2f} (via Market Summary)")
-            return lowest
+        if el:
+            row_text = el.text
+            extracted = extract_prices(row_text)
 
-    except PlaywrightTimeout:
-        log.warning(f"  Timeout: Market Summary box not found for '{card_name}'.")
-        log.warning(f"  Try running: python monitor.py --debug \"{card_name}\"")
+            if extracted:
+                lowest = min(extracted)
+                log.info(f"  Lowest price found: R$ {lowest:.2f} (via Market Summary)")
+                return lowest
+        else:
+            log.warning(f"  Timeout: Market Summary box not found for '{card_name}'.")
+            log.warning(f"  Try running: python monitor.py --debug \"{card_name}\"")
+
     except Exception as e:
         log.warning(f"  Price scan failed: {e}")
 
@@ -161,7 +157,7 @@ async def fetch_lowest_price(page, card_name: str) -> float | None:
     return None
 
 # ── Core monitor loop ─────────────────────────────────────────────────────────
-async def run_monitor():
+def run_monitor():
     cfg         = load_config()
     conn        = init_db()
     webhook_url = cfg["discord"]["webhook_url"]
@@ -174,22 +170,16 @@ async def run_monitor():
 
     log.info(f"Starting monitor — {len(cards)} card(s), threshold R$ {min_diff:.2f}")
 
-    async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=True)
-        context = await browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-        )
-        page = await context.new_page()
+    # Initialize DrissionPage browser ONCE for the whole loop
+    co = ChromiumOptions()
+    co.headless(False) # Runs silently in the background
+    co.set_argument('--no-sandbox')
+    co.set_argument('--window-size=100,100')
+    page = ChromiumPage(co)
 
-        async def block_resources(route):
-            if route.request.resource_type in ["image", "media", "font", "stylesheet"]:
-                await route.abort()
-            else:
-                await route.continue_()
-        await page.route("**/*", block_resources)
-
+    try:
         for card in cards:
-            current_price = await fetch_lowest_price(page, card)
+            current_price = fetch_lowest_price(page, card)
 
             if current_price is None:
                 log.warning(f"Skipping '{card}' — price unavailable.")
@@ -205,15 +195,17 @@ async def run_monitor():
                         f"Current: R$ {current_price:.2f} | Diff: R$ {diff:+.2f}"
                     )
                     if abs(diff) >= min_diff:
-                        sent = await send_discord_async(webhook_url, card, stored, current_price, build_url(card))
+                        sent = send_discord(webhook_url, card, stored, current_price, build_url(card))
                         if sent:
                             save_price(conn, card, current_price)
 
             delay = random.uniform(2, 5)
             log.info(f"  Waiting {delay:.1f}s…")
-            await asyncio.sleep(delay)
-
-        await browser.close()
+            time.sleep(delay)
+            
+    finally:
+        log.info("Closing browser.")
+        page.quit()
 
     conn.close()
     log.info("Monitor run complete.")
@@ -296,96 +288,41 @@ def cmd_reset() -> None:
     DB_FILE.unlink(missing_ok=True)
     print("  Price database reset.")
 
-async def cmd_debug(card_name: str) -> None:
-    """
-    Loads the card page and prints what the market summary box contains,
-    plus a broader scan so the selector can be fixed if needed.
-    """
+def cmd_debug(card_name: str) -> None:
     print(f"\n  🔍 Debug: {card_name}")
-    print(f"  URL: {build_url(card_name)}\n")
+    url = build_url(card_name)
+    print(f"  URL: {url}\n")
 
-    async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=True)
-        context = await browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-        )
-        page = await context.new_page()
+    co = ChromiumOptions()
+    co.headless(False) # Keep False to watch WAF bypass
+    page = ChromiumPage(co)
 
-        async def block_resources(route):
-            if route.request.resource_type in ["image", "media", "font", "stylesheet"]:
-                await route.abort()
-            else:
-                await route.continue_()
-        await page.route("**/*", block_resources)
-
-        try:
-            await page.goto(build_url(card_name), wait_until="domcontentloaded", timeout=20_000)
-            await page.wait_for_timeout(2000)
-        except Exception as e:
-            print(f"  ❌ Page load failed: {e}")
-            await browser.close()
-            return
-
-        # ── Primary selector (same as LigaMagic) ─────────────────────────
-        print("  ── Primary selector ──")
-        try:
-            el = page.locator("#container-price-mkp-card")
-            await el.wait_for(state="visible", timeout=5000)
-            text = await el.inner_text()
+    try:
+        print("  Navigating to page and waiting for Cloudflare...")
+        page.get(url)
+        
+        print("  Waiting up to 15s for the price container...")
+        el = page.ele("#container-price-mkp-card", timeout=15)
+        
+        if el: 
+            print("  ── Primary selector ──")
+            text = el.text
             prices = extract_prices(text)
-            print(f"  #container-price-mkp-card")
+            
             print(f"  text:   {repr(text)}")
             print(f"  prices: {prices}")
             if prices:
                 print(f"  → min: R$ {min(prices):.2f}")
-        except Exception as e:
-            print(f"  #container-price-mkp-card → not found: {e}")
+        else:
+            print("  ❌ Timeout: #container-price-mkp-card never appeared.")
+            page.get_screenshot(path="drission_vision.png")
+            print("  📸 Saved screenshot to drission_vision.png")
 
-        print()
+    except Exception as e:
+        print(f"  ❌ Error: {e}")
+    finally:
+        page.quit()
 
-        # ── Fallback selectors ────────────────────────────────────────────
-        print("  ── Fallback selectors ──")
-        fallbacks = [
-            ".price-mkp .min .price",
-            ".price-mkp",
-            "div.price",
-            "[class*='price']",
-            "[class*='preco']",
-        ]
-        for sel in fallbacks:
-            try:
-                texts = await page.locator(sel).all_inner_texts()
-                prices = []
-                for t in texts:
-                    prices.extend(extract_prices(t))
-                if prices:
-                    prices.sort()
-                    print(f"  {sel}")
-                    print(f"  prices: {prices}  → min: R$ {min(prices):.2f}\n")
-                else:
-                    print(f"  {sel}  → no prices found\n")
-            except Exception as e:
-                print(f"  {sel}  → error: {e}\n")
-
-        # ── Parent classes of div.price elements ─────────────────────────
-        print("  ── Parent classes of div.price elements ──")
-        try:
-            all_divs = await page.locator("div.price").all()
-            for i, el in enumerate(all_divs[:10]):
-                try:
-                    t = await el.inner_text()
-                    found = extract_prices(t)
-                    if not found:
-                        continue
-                    parent = await el.evaluate("el => el.parentElement?.className || ''")
-                    gp     = await el.evaluate("el => el.parentElement?.parentElement?.className || ''")
-                    print(f"  [{i+1}] prices={found}  parent={parent!r}  grandparent={gp!r}")
-                except Exception:
-                    continue
-        except Exception as e:
-            print(f"  error: {e}")
-
-        await browser.close()
     print("\n  Debug complete.\n")
 
 # ── Entry point ───────────────────────────────────────────────────────────────
@@ -416,6 +353,6 @@ if __name__ == "__main__":
     elif args.remove:  cmd_remove(args.remove)
     elif args.list:    cmd_list()
     elif args.test:    cmd_test()
-    elif args.debug:   asyncio.run(cmd_debug(args.debug))
+    elif args.debug:   cmd_debug(args.debug)
     elif args.reset:   cmd_reset()
-    else:              asyncio.run(run_monitor())
+    else:              run_monitor() # Now running completely synchronously!
