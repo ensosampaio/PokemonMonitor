@@ -174,7 +174,6 @@ def run_monitor():
     co = ChromiumOptions()
     co.headless(False) # Runs silently in the background
     co.set_argument('--no-sandbox')
-    co.set_argument('--window-size=100,100')
     page = ChromiumPage(co)
 
     try:
